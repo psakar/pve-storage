@@ -6,11 +6,11 @@ use warnings;
 use POSIX;
 
 use PVE::Diskmanage;
+use PVE::InitSystem;
 use PVE::JSONSchema qw(get_standard_option);
 use PVE::RESTHandler;
 use PVE::RPCEnvironment;
-use PVE::Systemd;
-use PVE::Tools qw(run_command trim file_set_contents file_get_contents dir_glob_foreach lock_file);
+use PVE::Tools qw(run_command dir_glob_foreach);
 
 use PVE::API2::Storage::Config;
 
@@ -19,76 +19,6 @@ use base qw(PVE::RESTHandler);
 my $SGDISK = '/sbin/sgdisk';
 my $MKFS = '/sbin/mkfs';
 my $BLKID = '/sbin/blkid';
-
-my $read_ini = sub {
-    my ($filename) = @_;
-
-    my $content = file_get_contents($filename);
-    my @lines = split /\n/, $content;
-
-    my $result = {};
-    my $section;
-
-    foreach my $line (@lines) {
-        $line = trim($line);
-        if ($line =~ m/^\[([^\]]+)\]/) {
-            $section = $1;
-            if (!defined($result->{$section})) {
-                $result->{$section} = {};
-            }
-        } elsif ($line =~ m/^(.*?)=(.*)$/) {
-            my ($key, $val) = ($1, $2);
-            if (!$section) {
-                warn "key value pair found without section, skipping\n";
-                next;
-            }
-
-            if ($result->{$section}->{$key}) {
-                # make duplicate properties to arrays to keep the order
-                my $prop = $result->{$section}->{$key};
-                if (ref($prop) eq 'ARRAY') {
-                    push @$prop, $val;
-                } else {
-                    $result->{$section}->{$key} = [$prop, $val];
-                }
-            } else {
-                $result->{$section}->{$key} = $val;
-            }
-        }
-        # ignore everything else
-    }
-
-    return $result;
-};
-
-my $write_ini = sub {
-    my ($ini, $filename) = @_;
-
-    my $content = "";
-
-    foreach my $sname (sort keys %$ini) {
-        my $section = $ini->{$sname};
-
-        $content .= "[$sname]\n";
-
-        foreach my $pname (sort keys %$section) {
-            my $prop = $section->{$pname};
-
-            if (!ref($prop)) {
-                $content .= "$pname=$prop\n";
-            } elsif (ref($prop) eq 'ARRAY') {
-                foreach my $val (@$prop) {
-                    $content .= "$pname=$val\n";
-                }
-            } else {
-                die "invalid property '$pname'\n";
-            }
-        }
-        $content .= "\n";
-    }
-
-    file_set_contents($filename, $content);
-};
 
 __PACKAGE__->register_method({
     name => 'index',
@@ -113,7 +43,8 @@ __PACKAGE__->register_method({
             properties => {
                 unitfile => {
                     type => 'string',
-                    description => 'The path of the mount unit.',
+                    description => 'The path of the mount unit, or of /etc/fstab without'
+                        . ' systemd.',
                 },
                 path => {
                     type => 'string',
@@ -139,26 +70,16 @@ __PACKAGE__->register_method({
 
         my $result = [];
 
-        dir_glob_foreach(
-            '/etc/systemd/system',
-            '^mnt-pve-(.+)\.mount$',
-            sub {
-                my ($filename, $storid) = @_;
-                $storid = PVE::Systemd::unescape_unit($storid);
-
-                my $unitfile = "/etc/systemd/system/$filename";
-                my $unit = $read_ini->($unitfile);
-
-                push @$result,
-                    {
-                        unitfile => $unitfile,
-                        path => "/mnt/pve/$storid",
-                        device => $unit->{'Mount'}->{'What'},
-                        type => $unit->{'Mount'}->{'Type'},
-                        options => $unit->{'Mount'}->{'Options'},
-                    };
-            },
-        );
+        for my $mount (PVE::InitSystem::list_mounts('/mnt/pve/')->@*) {
+            push @$result,
+                {
+                    unitfile => $mount->{config},
+                    path => $mount->{where},
+                    device => $mount->{what},
+                    type => $mount->{type},
+                    options => $mount->{options},
+                };
+        }
 
         return $result;
     },
@@ -213,8 +134,6 @@ __PACKAGE__->register_method({
         my $node = $param->{node};
         my $type = $param->{filesystem} // 'ext4';
         my $path = "/mnt/pve/$name";
-        my $mountunitname = PVE::Systemd::escape_unit($path, 1) . ".mount";
-        my $mountunitpath = "/etc/systemd/system/$mountunitname";
 
         $dev = PVE::Diskmanage::verify_blockdev_path($dev);
         PVE::Diskmanage::assert_disk_unused($dev);
@@ -241,7 +160,9 @@ __PACKAGE__->register_method({
         my $mounted = PVE::Diskmanage::mounted_paths();
         die "the path for '${name}' is already mounted: ${path} ($mounted->{$path})\n"
             if $mounted->{$path};
-        die "a systemd mount unit already exists: ${mountunitpath}\n" if -e $mountunitpath;
+        if (my $mount = PVE::InitSystem::get_mount($path)) {
+            die "a mount for '${path}' already exists: $mount->{config}\n";
+        }
 
         my $worker = sub {
             PVE::Diskmanage::locked_disk_action(sub {
@@ -275,16 +196,6 @@ __PACKAGE__->register_method({
                 print "# ", join(' ', @$cmd), "\n";
                 run_command($cmd);
 
-                # create systemd mount unit and enable & start it
-                my $ini = {
-                    'Unit' => {
-                        'Description' => "Mount storage '$name' under /mnt/pve",
-                    },
-                    'Install' => {
-                        'WantedBy' => 'multi-user.target',
-                    },
-                };
-
                 my $uuid_path;
                 my $uuid;
 
@@ -304,20 +215,17 @@ __PACKAGE__->register_method({
 
                 die "could not get UUID of device '$part'\n" if !$uuid;
 
-                $ini->{'Mount'} = {
-                    'What' => $uuid_path,
-                    'Where' => $path,
-                    'Type' => $type,
-                    'Options' => 'defaults',
-                };
-
-                $write_ini->($ini, $mountunitpath);
-
                 PVE::Diskmanage::udevadm_trigger($part);
 
-                run_command(['systemctl', 'daemon-reload']);
-                run_command(['systemctl', 'enable', $mountunitname]);
-                run_command(['systemctl', 'start', $mountunitname]);
+                # create a persistent mount (a systemd mount unit, or an fstab entry without
+                # systemd) and mount it
+                PVE::InitSystem::create_mount(
+                    where => $path,
+                    what => $uuid_path,
+                    type => $type,
+                    options => 'defaults',
+                    description => "Mount storage '$name' under /mnt/pve",
+                );
 
                 if ($param->{add_storage}) {
                     PVE::API2::Storage::Config->create_or_update(
@@ -378,15 +286,14 @@ __PACKAGE__->register_method({
 
         my $worker = sub {
             my $path = "/mnt/pve/$name";
-            my $mountunitname = PVE::Systemd::escape_unit($path, 1) . ".mount";
-            my $mountunitpath = "/etc/systemd/system/$mountunitname";
 
             PVE::Diskmanage::locked_disk_action(sub {
                 my $to_wipe;
                 if ($param->{'cleanup-disks'}) {
-                    my $unit = $read_ini->($mountunitpath);
+                    my $mount = PVE::InitSystem::get_mount($path)
+                        or die "no mount for '$path' found\n";
 
-                    my $dev = PVE::Diskmanage::verify_blockdev_path($unit->{'Mount'}->{'What'});
+                    my $dev = PVE::Diskmanage::verify_blockdev_path($mount->{what});
                     $to_wipe = $dev;
 
                     # clean up whole device if this is the only partition
@@ -397,12 +304,7 @@ __PACKAGE__->register_method({
                         if $info->{$dev}->{parent} && scalar(keys $info->%*) == 2;
                 }
 
-                run_command(['systemctl', 'stop', $mountunitname]);
-                run_command(['systemctl', 'disable', $mountunitname]);
-
-                unlink $mountunitpath
-                    or $! == ENOENT
-                    or die "cannot remove $mountunitpath - $!\n";
+                PVE::InitSystem::remove_mount($path);
 
                 my $config_err;
                 if ($param->{'cleanup-config'}) {

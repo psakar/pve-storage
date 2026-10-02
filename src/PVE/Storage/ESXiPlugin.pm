@@ -9,6 +9,7 @@ use JSON qw(from_json);
 use Net::IP;
 use POSIX ();
 
+use PVE::InitSystem;
 use PVE::Network;
 use PVE::Systemd;
 use PVE::Tools qw(file_get_contents file_set_contents run_command);
@@ -274,9 +275,8 @@ sub esxi_unmount : prototype($$$) {
     my $scope = "${scope_name_base}.scope";
     my $mount_dir = mount_dir($storeid);
 
-    my %silence_std_outs = (outfunc => sub { }, errfunc => sub { });
-    eval { run_command(['/bin/systemctl', 'reset-failed', $scope], %silence_std_outs) };
-    eval { run_command(['/bin/systemctl', 'stop', $scope], %silence_std_outs) };
+    PVE::InitSystem::reset_failed($scope);
+    eval { PVE::InitSystem::stop_scope($scope) };
     run_command(['/bin/umount', $mount_dir]);
 }
 

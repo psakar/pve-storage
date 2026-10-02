@@ -4,6 +4,7 @@ use strict;
 use warnings;
 
 use PVE::Diskmanage;
+use PVE::InitSystem;
 use PVE::JSONSchema qw(get_standard_option parse_property_string);
 use PVE::Systemd;
 use PVE::API2::Storage::Config;
@@ -508,12 +509,15 @@ __PACKAGE__->register_method({
             print "# ", join(' ', @$cmd), "\n";
             run_command($cmd);
 
-            if (-e '/lib/systemd/system/zfs-import@.service') {
-                my $importunit =
-                    'zfs-import@' . PVE::Systemd::escape_unit($name, undef) . '.service';
-                $cmd = ['systemctl', 'enable', $importunit];
-                print "# ", join(' ', @$cmd), "\n";
-                run_command($cmd);
+            # Without systemd (e.g. sysvinit or OpenRC), there's no zfs-import@ service, even if
+            # ZFS ships the unit file: pools get imported from the cache file at boot there.
+            my $importunit = 'zfs-import@' . PVE::Systemd::escape_unit($name, undef) . '.service';
+            if (
+                -e '/lib/systemd/system/zfs-import@.service'
+                && PVE::InitSystem::service_status($importunit)->{load_state} ne 'not-found'
+            ) {
+                print "# systemctl enable $importunit\n";
+                PVE::InitSystem::enable_service($importunit);
             }
 
             PVE::Diskmanage::udevadm_trigger($devs->@*);
@@ -619,10 +623,12 @@ __PACKAGE__->register_method({
                     );
                 }
 
-                if (-e '/lib/systemd/system/zfs-import@.service') {
-                    my $importunit =
-                        'zfs-import@' . PVE::Systemd::escape_unit($name) . '.service';
-                    run_command(['systemctl', 'disable', $importunit]);
+                my $importunit = 'zfs-import@' . PVE::Systemd::escape_unit($name) . '.service';
+                if (
+                    -e '/lib/systemd/system/zfs-import@.service'
+                    && PVE::InitSystem::service_status($importunit)->{load_state} ne 'not-found'
+                ) {
+                    PVE::InitSystem::disable_service($importunit);
                 }
 
                 run_command(['zpool', 'destroy', $name]);

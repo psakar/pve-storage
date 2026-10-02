@@ -8,11 +8,11 @@ use Net::IP;
 use File::Path;
 
 use PVE::CephConfig;
+use PVE::InitSystem;
 use PVE::JSONSchema qw(get_standard_option);
 use PVE::ProcFSTools;
 use PVE::Storage::Plugin;
-use PVE::Systemd;
-use PVE::Tools qw(run_command file_set_contents);
+use PVE::Tools qw(run_command);
 
 use base qw(PVE::Storage::Plugin);
 
@@ -36,44 +36,6 @@ sub cephfs_is_mounted {
         if grep { $_->[1] eq $mountpoint } @$mountdata;
 
     return undef;
-}
-
-# FIXME: remove once it's possible to specify _netdev for fuse.ceph mounts
-sub systemd_netmount {
-    my ($where, $type, $what, $opts) = @_;
-
-    # don't do default deps, systemd v241 generator produces ordering deps on both
-    # local-fs(-pre) and remote-fs(-pre) targets if we use the required _netdev
-    # option. Over three corners this gets us an ordering cycle on shutdown, which
-    # may make shutdown hang if the random cycle breaking hits the "wrong" unit to
-    # delete.
-    my $unit = <<"EOF";
-[Unit]
-Description=${where}
-DefaultDependencies=no
-Requires=system.slice
-Wants=network-online.target
-Before=umount.target remote-fs.target
-After=systemd-journald.socket system.slice network.target -.mount remote-fs-pre.target network-online.target
-Conflicts=umount.target
-
-[Mount]
-Where=${where}
-What=${what}
-Type=${type}
-Options=${opts}
-EOF
-
-    my $unit_fn = PVE::Systemd::escape_unit($where, 1) . ".mount";
-    my $unit_path = "/run/systemd/system/$unit_fn";
-    my $daemon_needs_reload = -e $unit_path;
-
-    file_set_contents($unit_path, $unit);
-
-    run_command(['systemctl', 'daemon-reload'], errmsg => "daemon-reload error")
-        if $daemon_needs_reload;
-    run_command(['systemctl', 'start', $unit_fn], errmsg => "mount error");
-
 }
 
 sub cephfs_mount {
@@ -105,7 +67,9 @@ sub cephfs_mount {
 
     push @opts, $scfg->{options} if $scfg->{options};
 
-    systemd_netmount($mountpoint, $type, "$server:$subdir", join(',', @opts));
+    # with systemd a runtime mount unit without default dependencies: there's no _netdev for
+    # fuse.ceph mounts, and systemd's generator would create shutdown ordering cycles
+    PVE::InitSystem::mount_runtime($mountpoint, $type, "$server:$subdir", join(',', @opts));
 }
 
 # Configuration

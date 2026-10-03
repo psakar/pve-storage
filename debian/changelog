@@ -1,3 +1,11 @@
+libpve-storage-perl (9.1.11+devuan1) trixie; urgency=medium
+
+  * build for systemd-free derivatives like Devuan (sysvinit or OpenRC),
+    with the init-system changes of the feature/init-systems-refactoring
+    branch
+
+ -- Petr Sakař <petr.sakar@chare.eu>  Sat, 03 Oct 2026 08:15:11 +0200
+
 libpve-storage-perl (9.1.11) trixie; urgency=medium
 
   * fix #7598: qemu-img: increase timeout for image resizing in worker context

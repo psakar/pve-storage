@@ -1,3 +1,11 @@
+libpve-storage-perl (9.1.15+devuan1) trixie; urgency=medium
+
+  * build for systemd-free derivatives like Devuan (sysvinit or OpenRC),
+    with the init-system changes of the feature/init-systems-refactoring
+    branch
+
+ -- Petr Sakař <petr.sakar@chare.eu>  Tue, 10 Nov 2026 20:34:50 +0100
+
 libpve-storage-perl (9.1.15) trixie; urgency=medium
 
   * remote commands: shell-quote the arguments of commands run on other nodes or
